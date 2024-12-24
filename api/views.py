@@ -1,49 +1,56 @@
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
-from tensorflow.keras.models import load_model
-from PIL import Image
+import onnxruntime as ort
+import io
+from torchvision import transforms
 import numpy as np
+import cv2
+import torch
+from PIL import Image
+import os
 
 # Create your views here.
-MODEL_PATH = "model/cnn_notMNIST.keras"
-model = load_model(MODEL_PATH)
+MODEL_PATH = "model/best.pt"
+# onnx_session = ort.InferenceSession(MODEL_PATH)
 
-CLASS_LABELS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J']
+checkpoint = torch.load(MODEL_PATH)
+model = checkpoint['model']
+model = model.float()
 
-@csrf_exempt
-def upload_video_and_process(request):
-    if request.method == 'POST' and request.FILES.get('video'):
-        video_file = request.FILES['video']
-        result = {"label": "Object Detected", "confidence": 0.92}
-
-        return JsonResponse({
-            'message': 'Video processed successfully!',
-            'result': result
-        }, status=200)
-
-    return JsonResponse({'error': 'Invalid request. Please upload a video file.'}, status=400)
-
+def preprocess_image(file):
+    image = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
+    image = cv2.resize(image, (640, 640))
+    image = image.astype(np.float32) / 255.0
+    image = image.transpose(2, 0, 1)
+    image = np.expand_dims(image, axis=0)
+    return image
 
 @csrf_exempt
-def classify_letter(request):
+def upload_image_and_process(request):
     if request.method == 'POST' and request.FILES.get('image'):
-        image_file = request.FILES['image']
-        image = Image.open(image_file).convert('L')
+        image = request.FILES['image']
+        pil_image = Image.open(image)
+        image_np = np.array(pil_image.convert("RGB"))
+        print(model)
+        image_resized = cv2.resize(image_np, (640, 640))
+        image_tensor = transforms.ToTensor()(image_resized)
+        image_tensor = image_tensor.unsqueeze(0).float()
 
-        image = image.resize((28, 28))
-        image_array = np.array(image) / 255.0
-        image_array = image_array.reshape(1, 28, 28, 1)
+        with torch.no_grad():
+            output = model(image_tensor)
 
-        predictions = model.predict(image_array)
-        predicted_index = np.argmax(predictions[0])
-        predicted_letter = CLASS_LABELS[predicted_index]
-        confidence = float(np.max(predictions[0]))
+        annotated_image = output[0].cpu().numpy()
+        annotated_image_bgr = cv2.cvtColor(annotated_image, cv2.COLOR_RGB2BGR)
+        _, encoded_image = cv2.imencode('.png', annotated_image_bgr)
+        current_directory = os.path.dirname(os.path.abspath(__file__))
 
-        return JsonResponse({
-            'message': 'Image classified successfully!',
-            'predicted_letter': predicted_letter,
-            'confidence': confidence
-        }, status=200)
+        output_filename = "annotated_image.png"
 
-    return JsonResponse({'error': 'Invalid request. Please upload an image.'}, status=400)
+        output_path = os.path.join(current_directory, output_filename)
+
+        cv2.imwrite(output_path, annotated_image_bgr)
+        response = HttpResponse(encoded_image.tobytes(), content_type="image/png")
+        return response
+
+    return JsonResponse({'error': 'Invalid request. Please upload a image file.'}, status=400)
 
